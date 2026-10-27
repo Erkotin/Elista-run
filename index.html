@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Элиста: захват территорий</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+:root{--bg:#fff;--fg:#1c2420;--mut:#5f6a63;--line:#dfe5e0;--btn:#1c2420;--btnfg:#fff;color-scheme:light dark}
+@media(prefers-color-scheme:dark){:root{--bg:#1b211e;--fg:#e8ede9;--mut:#9aa59e;--line:#2a332e;--btn:#e8ede9;--btnfg:#1b211e}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{display:flex;flex-direction:column;padding-top:env(safe-area-inset-top,0px);background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;line-height:1.35}
+#map{flex:1;min-height:0}
+#panel{padding:10px 12px calc(10px + env(safe-area-inset-bottom,0px));border-top:1px solid var(--line)}
+#stats{font-weight:600;font-size:15px}
+#toast{font-size:13px;color:var(--mut);margin:4px 0 8px;min-height:36px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+button{font:inherit;border:0;border-radius:10px;padding:10px 14px;cursor:pointer;background:var(--btn);color:var(--btnfg)}
+button.sec{background:transparent;color:var(--fg);border:1px solid var(--line)}
+button#run{flex:1;font-weight:600}
+label{font-size:13px;color:var(--mut);display:flex;gap:6px;align-items:center}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <div id="stats">Зон: 0</div>
+  <div id="toast">Нажмите «Начать пробежку», разрешите доступ к геолокации и замкните круг.</div>
+  <div class="row">
+    <button id="run">Начать пробежку</button>
+    <button id="home" class="sec">Мой дом</button>
+    <button id="reset" class="sec">Сбросить</button>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <label><input type="checkbox" id="sim"> Тест без GPS: во время «пробежки» нажимайте на карте точки маршрута</label>
+  </div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+(function(){
+var LAT0=46.3078,LON0=44.2558,R=100,SQ=Math.sqrt(3),KM2=3*SQ/2*R*R/1e6;
+var MX=111320*Math.cos(LAT0*Math.PI/180),MY=110574;
+var CLOSE=100,MINLEN=400,STEP=30,HOME_R=250,VMAX=20/3.6,SHIELD_MS=12*3600*1000;
+var toastEl=document.getElementById('toast'),statsEl=document.getElementById('stats');
+function msg(t){toastEl.textContent=t}
+function word(n){var a=n%10,b=n%100;if(a===1&&b!==11)return'зона';if(a>1&&a<5&&(b<10||b>20))return'зоны';return'зон'}
+
+/* ---- хранилище: всё остаётся на этом устройстве ---- */
+var S=load();
+function load(){try{var s=JSON.parse(localStorage.getItem('elistarun')||'');if(s&&s.owner)return s;}catch(e){}return{owner:{},shield:{},home:null};}
+function save(){try{localStorage.setItem('elistarun',JSON.stringify(S));}catch(e){}}
+
+/* ---- геометрия: метры вокруг центра Элисты ---- */
+function ll2xy(lat,lon){return[(lon-LON0)*MX,(LAT0-lat)*MY]}
+function xy2ll(x,y){return[LAT0-y/MY,LON0+x/MX]}
+function dist(a,b){return Math.hypot(a[0]-b[0],a[1]-b[1])}
+function center(q,r){return[R*SQ*(q+r/2),R*1.5*r]}
+function inside(px,py,poly){
+  var c=false;
+  for(var i=0,j=poly.length-1;i<poly.length;j=i++){
+    var xi=poly[i][0],yi=poly[i][1],xj=poly[j][0],yj=poly[j][1];
+    if((yi>py)!==(yj>py)&&px<(xj-xi)*(py-yi)/(yj-yi)+xi)c=!c;
+  }
+  return c;
+}
+function fillPoly(poly){
+  var x0=1e9,y0=1e9,x1=-1e9,y1=-1e9,res={total:0,mine:0,gain:0,keys:[]};
+  poly.forEach(function(p){x0=Math.min(x0,p[0]);x1=Math.max(x1,p[0]);y0=Math.min(y0,p[1]);y1=Math.max(y1,p[1]);});
+  for(var r=Math.floor(y0/(R*1.5))-1;r<=Math.ceil(y1/(R*1.5))+1;r++){
+    for(var q=Math.floor(x0/(R*SQ)-r/2)-1;q<=Math.ceil(x1/(R*SQ)-r/2)+1;q++){
+      var c=center(q,r);
+      if(!inside(c[0],c[1],poly))continue;
+      var k=q+','+r;res.total++;
+      if(S.owner[k]){res.mine++;}else{S.owner[k]=1;res.gain++;}
+      res.keys.push(k);
+    }
+  }
+  return res;
+}
+
+/* ---- карта ---- */
+var map=L.map('map',{preferCanvas:true}).setView([LAT0,LON0],14);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap'}).addTo(map);
+var cells=L.layerGroup().addTo(map);
+var trailLine=L.polyline([],{color:'#e5533d',weight:4}).addTo(map);
+var homeCircle=null;
+function drawHome(){
+  if(homeCircle){map.removeLayer(homeCircle);homeCircle=null;}
+  if(S.home){var ll=xy2ll(S.home[0],S.home[1]);
+    homeCircle=L.circle(ll,{radius:HOME_R,color:'#888',weight:1,dashArray:'4 4',fillOpacity:.08}).addTo(map);}
+}
+function render(){
+  cells.clearLayers();
+  var now=Date.now(),n=0,p=0;
+  for(var k in S.owner){
+    var a=k.split(','),c=center(+a[0],+a[1]),sh=S.shield[k]>now,pts=[];
+    for(var i=0;i<6;i++){var ang=Math.PI/180*(60*i-30);pts.push(xy2ll(c[0]+R*Math.cos(ang),c[1]+R*Math.sin(ang)));}
+    L.polygon(pts,{color:'#2b7de9',weight:sh?3:1,fillColor:'#2b7de9',fillOpacity:.4}).addTo(cells);
+    n++;if(sh)p++;
+  }
+  statsEl.textContent=n+' '+word(n)+' · '+(n*KM2).toFixed(2).replace('.',',')+' км²'+(p?' · под защитой: '+p:'');
+}
+
+/* ---- пробежка ---- */
+var running=false,track=[],cum=[],watchId=null,last=null,wl=null,loops=0;
+function pushPt(q,gap){
+  var l=track[track.length-1];
+  cum.push((cum[cum.length-1]||0)+(l&&!gap?dist(q,l):0));
+  track.push(q);
+}
+function addPoint(p,gap){
+  var l=track[track.length-1];
+  if(!l||gap){pushPt(p,true);track.loopFrom=track.length-1;}
+  else{
+    var d=dist(p,l);
+    if(d<10)return;
+    var n=Math.ceil(d/STEP);
+    for(var i=1;i<=n;i++){pushPt([l[0]+(p[0]-l[0])*i/n,l[1]+(p[1]-l[1])*i/n],false);checkLoop();}
+  }
+  trailLine.setLatLngs(track.map(function(q){return xy2ll(q[0],q[1]);}));
+}
+function checkLoop(){
+  var n=track.length,from=track.loopFrom||0,end=track[n-1];
+  for(var j=from;j<n-1;j++){
+    if(cum[n-1]-cum[j]<MINLEN)break;
+    if(dist(end,track[j])<CLOSE){closeLoop(track.slice(j));track.loopFrom=n-1;return;}
+  }
+}
+function closeLoop(poly){
+  var r=fillPoly(poly),rep=r.total>=3&&r.mine/r.total>=0.7;
+  loops++;
+  if(rep)r.keys.forEach(function(k){S.shield[k]=Date.now()+SHIELD_MS;});
+  save();render();
+  var m='Круг замкнут: новых зон '+r.gain+'.';
+  if(rep)m+=' Вы пробежали этот круг повторно: зоны под защитой 12 часов.';
+  msg(m);
+}
+function onPos(pos){
+  var acc=pos.coords.accuracy;
+  if(acc>60){msg('Слабый сигнал GPS (точность '+Math.round(acc)+' м). Выйдите на открытое место.');return;}
+  var p=ll2xy(pos.coords.latitude,pos.coords.longitude),t=pos.timestamp;
+  if(S.home&&dist(p,S.home)<HOME_R){last=null;if(track.length)track.gap=true;return;}
+  var gap=!!track.gap;
+  if(last){
+    var dt=(t-last.t)/1000,d=dist(p,last.p);
+    if(dt>0&&d/dt>VMAX){last={p:p,t:t};track.gap=true;msg('Скорость выше 20 км/ч: этот участок не засчитан.');return;}
+  }
+  last={p:p,t:t};track.gap=false;
+  addPoint(p,gap);
+}
+function onErr(e){msg('Не удалось получить GPS: разрешите доступ к геолокации в настройках браузера.');}
+var runBtn=document.getElementById('run'),simEl=document.getElementById('sim');
+function startRun(){
+  running=true;track=[];cum=[];last=null;loops=0;trailLine.setLatLngs([]);runBtn.textContent='Закончить пробежку';
+  if(simEl.checked){msg('Тестовый режим: нажимайте на карте точки маршрута и замкните круг.');}
+  else{
+    if(!navigator.geolocation){msg('Этот браузер не поддерживает геолокацию.');running=false;runBtn.textContent='Начать пробежку';return;}
+    msg('Ищем GPS…');
+    watchId=navigator.geolocation.watchPosition(onPos,onErr,{enableHighAccuracy:true,maximumAge:0,timeout:20000});
+    if(navigator.wakeLock)navigator.wakeLock.request('screen').then(function(w){wl=w;}).catch(function(){});
+  }
+}
+function stopRun(){
+  running=false;runBtn.textContent='Начать пробежку';
+  if(watchId!==null){navigator.geolocation.clearWatch(watchId);watchId=null;}
+  if(wl){try{wl.release();}catch(e){}wl=null;}
+  if(!loops)msg('Круг не замкнут, территория не захвачена.');
+}
+runBtn.onclick=function(){running?stopRun():startRun();};
+map.on('click',function(e){if(running&&simEl.checked)addPoint(ll2xy(e.latlng.lat,e.latlng.lng),false);});
+
+/* ---- дом и сброс ---- */
+document.getElementById('home').onclick=function(){
+  function set(ll,how){S.home=ll2xy(ll[0],ll[1]);save();drawHome();msg('Дом задан '+how+'. Первые и последние 250 м пробежки вокруг него не записываются.');}
+  if(!navigator.geolocation){var c=map.getCenter();set([c.lat,c.lng],'по центру карты');return;}
+  navigator.geolocation.getCurrentPosition(
+    function(pos){set([pos.coords.latitude,pos.coords.longitude],'по вашему положению');},
+    function(){var c=map.getCenter();set([c.lat,c.lng],'по центру карты (GPS недоступен)');},
+    {enableHighAccuracy:true,timeout:15000});
+};
+document.getElementById('reset').onclick=function(){
+  if(running)return;
+  if(confirm('Стереть всю захваченную территорию и точку дома?')){S={owner:{},shield:{},home:null};save();render();drawHome();msg('Всё стёрто.');}
+};
+drawHome();render();setInterval(render,60000);
+})();
+</script>
+</body>
+</html>
